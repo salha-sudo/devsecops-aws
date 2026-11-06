@@ -1,0 +1,24 @@
+# Build -> scan Trivy -> push ECR (le push n'a lieu que si le scan passe).
+version: 0.2
+env:
+  shell: bash
+  variables:
+    TRIVY_VERSION: "v0.58.1"
+phases:
+  install:
+    commands:
+      - curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin ${TRIVY_VERSION}
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${ECR_REPO_URI%%/*}
+      - export IMAGE_TAG="b${CODEBUILD_BUILD_NUMBER}-$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)"
+      - echo "Image tag $IMAGE_TAG"
+  build:
+    commands:
+      - docker build -t $ECR_REPO_URI:$IMAGE_TAG app/
+      - trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 $ECR_REPO_URI:$IMAGE_TAG
+      - docker push $ECR_REPO_URI:$IMAGE_TAG
+      - printf '{"ImageTag":"%s"}' "$IMAGE_TAG" > imageTag.json
+artifacts:
+  files:
+    - imageTag.json

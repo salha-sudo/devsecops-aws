@@ -1,0 +1,13 @@
+version: 0.2
+env:
+  shell: bash
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet -r app/requirements.txt pytest ruff
+  build:
+    commands:
+      - ruff check app/
+      - cd app && pytest -q

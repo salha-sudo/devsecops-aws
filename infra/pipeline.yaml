@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Pipeline DevSecOps - CodePipeline, CodeBuild (scans), ECR, ECS Fargate (staging + DAST + approbation + prod)
+
+Parameters:
+  GitHubOwner:
+    Type: String
+  GitHubRepo:
+    Type: String
+  GitHubBranch:
+    Type: String
+    Default: main
+  NotificationEmail:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: String
+    Description: Sous-reseaux separes par des virgules (2 AZ minimum)
+
+Resources:
+  # ------------------------------------------------------------ Chiffrement & stockage
+  ArtifactKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Chiffrement des artefacts du pipeline
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"}
+            Action: "kms:*"
+            Resource: "*"
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ArtifactKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire, Status: Enabled, ExpirationInDays: 30}
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
+
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-app"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 30","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}]}'
+
+  # ------------------------------------------------------------ Notifications
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - {Protocol: email, Endpoint: !Ref NotificationEmail}
+
+  TopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref Topic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: "sns:Publish"
+            Resource: !Ref Topic
+
+  # NB: le topic utilise la cle AWS-managed ; EventBridge peut publier si la cle est alias/aws/sns uniquement
+  # pour les abonnements email. Pour une cle KMS custom, ajouter kms:GenerateDataKey/Decrypt a events.amazonaws.com.
+
+  FailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Alerte quand le pipeline echoue
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Pipeline Execution State Change]
+        detail:
+          state: [FAILED]
+          pipeline: [!Ref Pipeline]
+      Targets:
+        - {Id: sns, Arn: !Ref Topic}
+
+  # ------------------------------------------------------------ Connexion GitHub
+  Connection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "${AWS::StackName}-gh"
+      ProviderType: GitHub
+
+  # ------------------------------------------------------------ IAM (moindre privilege, 1 role par usage)
+  BuildBasePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*:*"
+          - Effect: Allow
+            Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketLocation]
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+          - Effect: Allow
+            Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey]
+            Resource: !GetAtt ArtifactKey.Arn
+
+  ScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns: [!Ref BuildBasePolicy]
+
+  ImageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns: [!Ref BuildBasePolicy]
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: "ecr:GetAuthorizationToken", Resource: "*"}
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt EcrRepo.Arn
+
+  DastRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns: [!Ref BuildBasePolicy]
+      Policies:
+        - PolicyName: read-staging-outputs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-app-staging/*"
+
+  # Role utilise par CloudFormation pour deployer les stacks applicatifs
+  # (perimetre limite aux services de l'app ; IAM restreint aux roles prefixes par le nom du pipeline)
+  CfnDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: cloudformation.amazonaws.com}, Action: "sts:AssumeRole"}
+      Policies:
+        - PolicyName: deploy-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ecs:*, elasticloadbalancing:*, wafv2:*]
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateTags
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DeleteLogGroup, logs:PutRetentionPolicy, logs:DescribeLogGroups, logs:TagResource, logs:ListTagsForResource]
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-app-*"
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: codepipeline.amazonaws.com}, Action: "sts:AssumeRole"}
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey]
+                Resource: !GetAtt ArtifactKey.Arn
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-*"
+              - Effect: Allow
+                Action: [codestar-connections:UseConnection, codeconnections:UseConnection]
+                Resource: !Ref Connection
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:GetTemplate
+                  - cloudformation:SetStackPolicy
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-app-*/*"
+              - {Effect: Allow, Action: "cloudformation:ValidateTemplate", Resource: "*"}
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnDeployRole.Arn
+                Condition:
+                  StringEquals: {"iam:PassedToService": cloudformation.amazonaws.com}
+              - {Effect: Allow, Action: "sns:Publish", Resource: !Ref Topic}
+
+  # ------------------------------------------------------------ CodeBuild
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-test"
+      ServiceRole: !GetAtt ScanRole.Arn
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      TimeoutInMinutes: 15
+      Artifacts: {Type: CODEPIPELINE}
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspecs/build-test.yml}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+
+  SecurityProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-security"
+      ServiceRole: !GetAtt ScanRole.Arn
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      TimeoutInMinutes: 30
+      Artifacts: {Type: CODEPIPELINE}
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspecs/security.yml}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+
+  ImageProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-image"
+      ServiceRole: !GetAtt ImageRole.Arn
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      TimeoutInMinutes: 30
+      Artifacts: {Type: CODEPIPELINE}
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspecs/image.yml}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: ECR_REPO_URI, Value: !GetAtt EcrRepo.RepositoryUri}
+
+  DastProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-dast"
+      ServiceRole: !GetAtt DastRole.Arn
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      TimeoutInMinutes: 30
+      Artifacts: {Type: CODEPIPELINE}
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspecs/dast.yml}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+
+  # ------------------------------------------------------------ Pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        EncryptionKey: {Type: KMS, Id: !GetAtt ArtifactKey.Arn}
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1"}
+              Configuration:
+                ConnectionArn: !Ref Connection
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: "true"
+              OutputArtifacts: [{Name: SourceOutput}]
+
+        - Name: TestAndScan
+          Actions:
+            - Name: UnitTests
+              RunOrder: 1
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration: {ProjectName: !Ref TestProject}
+              InputArtifacts: [{Name: SourceOutput}]
+            - Name: SecurityScans
+              RunOrder: 1
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration: {ProjectName: !Ref SecurityProject}
+              InputArtifacts: [{Name: SourceOutput}]
+
+        - Name: BuildImage
+          Actions:
+            - Name: BuildScanPush
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration: {ProjectName: !Ref ImageProject}
+              InputArtifacts: [{Name: SourceOutput}]
+              OutputArtifacts: [{Name: BuildOutput}]
+
+        - Name: Staging
+          Actions:
+            - Name: DeployStaging
+              RunOrder: 1
+              ActionTypeId: {Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1"}
+              InputArtifacts: [{Name: SourceOutput}, {Name: BuildOutput}]
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub "${AWS::StackName}-app-staging"
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt CfnDeployRole.Arn
+                TemplatePath: "SourceOutput::infra/app-stack.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "Env": "staging",
+                    "ImageUri": "${EcrRepo.RepositoryUri}",
+                    "ImageTag": { "Fn::GetParam": ["BuildOutput", "imageTag.json", "ImageTag"] },
+                    "VpcId": "${VpcId}",
+                    "SubnetIds": "${SubnetIds}"
+                  }
+            - Name: DAST-ZAP
+              RunOrder: 2
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              InputArtifacts: [{Name: SourceOutput}]
+              Configuration:
+                ProjectName: !Ref DastProject
+                EnvironmentVariables: !Sub '[{"name":"STACK_NAME","value":"${AWS::StackName}-app-staging","type":"PLAINTEXT"}]'
+
+        - Name: Approval
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId: {Category: Approval, Owner: AWS, Provider: Manual, Version: "1"}
+              Configuration:
+                NotificationArn: !Ref Topic
+                CustomData: Verifier le rapport ZAP et le staging avant la mise en production.
+
+        - Name: Production
+          Actions:
+            - Name: DeployProd
+              ActionTypeId: {Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1"}
+              InputArtifacts: [{Name: SourceOutput}, {Name: BuildOutput}]
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub "${AWS::StackName}-app-prod"
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt CfnDeployRole.Arn
+                TemplatePath: "SourceOutput::infra/app-stack.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "Env": "prod",
+                    "ImageUri": "${EcrRepo.RepositoryUri}",
+                    "ImageTag": { "Fn::GetParam": ["BuildOutput", "imageTag.json", "ImageTag"] },
+                    "VpcId": "${VpcId}",
+                    "SubnetIds": "${SubnetIds}"
+                  }
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  ConnectionArn:
+    Value: !Ref Connection
+  EcrRepoUri:
+    Value: !GetAtt EcrRepo.RepositoryUri
+  ArtifactBucket:
+    Value: !Ref ArtifactBucket

@@ -1,0 +1,17 @@
+# DAST : OWASP ZAP baseline contre l'environnement de staging.
+version: 0.2
+env:
+  shell: bash
+phases:
+  pre_build:
+    commands:
+      - export APP_URL=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text)
+      - echo "Cible DAST $APP_URL"
+      - for i in $(seq 1 30); do curl -sf $APP_URL/health && break || sleep 10; done
+  build:
+    commands:
+      - chmod 777 $PWD
+      - docker run --rm -v $PWD:/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t $APP_URL -r zap-report.html -I
+artifacts:
+  files:
+    - zap-report.html
